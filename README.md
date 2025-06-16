@@ -1,5 +1,5 @@
 # XMongoDB Server
-
+![XMySQL Logo](xmongodb-logo.png)
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 ![Go Version](https://img.shields.io/badge/go-1.21+-blue)
 ![License](https://img.shields.io/badge/license-Apache%202.0-green)
@@ -532,11 +532,6 @@ go test ./...
 - 感谢 MongoDB 官方文档和规范
 - 感谢所有贡献者的努力
 
-## 📞 联系我们
-
-- GitHub Issues: [问题反馈](https://github.com/zhukovaskychina/xmongodb/issues)
-- Email: [your-email@example.com](mailto:your-email@example.com)
-- 微信群: [扫码加入开发群]
 
 ---
 
