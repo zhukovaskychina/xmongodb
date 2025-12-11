@@ -2,12 +2,17 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sync"
+	"sync/atomic"
 
 	"github.com/zhukovaskychina/xmongodb/config"
+	"github.com/zhukovaskychina/xmongodb/server/protocol/bsoncore"
 )
 
 // Engine 存储引擎接口
+// 这是对外的高层接口，内部使用 KVEngine 实现
 type Engine interface {
 	// 基础操作
 	Start() error
@@ -63,38 +68,71 @@ func NewEngine(cfg config.StorageConfig) (Engine, error) {
 }
 
 // WiredTigerEngine WiredTiger 存储引擎
+// 基于 KVEngine 构建的高层存储引擎
 type WiredTigerEngine struct {
+	mu sync.RWMutex
+	
 	config    config.StorageConfig
 	databases map[string]*Database
 	running   bool
+	
+	// 底层 KV 引擎
+	kvEngine KVEngine
+	
+	// 下一个 RecordId
+	nextRecordId int64
 }
 
 // NewWiredTigerEngine 创建 WiredTiger 引擎
 func NewWiredTigerEngine(cfg config.StorageConfig) (*WiredTigerEngine, error) {
+	// 创建 KV 引擎配置
+	kvConfig := KVEngineConfig{
+		CacheSize:         1024 * 1024 * 1024, // 1GB
+		MaxSessions:       1000,
+		CheckpointEnabled: true,
+	}
+	
 	return &WiredTigerEngine{
 		config:    cfg,
 		databases: make(map[string]*Database),
+		kvEngine:  NewKVEngine(kvConfig),
 	}, nil
 }
 
 // Start 启动引擎
 func (e *WiredTigerEngine) Start() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	
 	if e.running {
 		return fmt.Errorf("存储引擎已经在运行")
 	}
 
-	// TODO: 初始化 WiredTiger
+	// 启动底层 KV 引擎
+	ctx := context.Background()
+	if err := e.kvEngine.Start(ctx); err != nil {
+		return fmt.Errorf("启动 KV 引擎失败: %w", err)
+	}
+	
 	e.running = true
 	return nil
 }
 
 // Stop 停止引擎
 func (e *WiredTigerEngine) Stop() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	
 	if !e.running {
 		return nil
 	}
 
-	// TODO: 停止 WiredTiger
+	// 停止底层 KV 引擎
+	ctx := context.Background()
+	if err := e.kvEngine.Stop(ctx); err != nil {
+		return fmt.Errorf("停止 KV 引擎失败: %w", err)
+	}
+	
 	e.running = false
 	return nil
 }
@@ -138,6 +176,9 @@ func (e *WiredTigerEngine) ListDatabases(ctx context.Context) ([]string, error) 
 
 // CreateCollection 创建集合
 func (e *WiredTigerEngine) CreateCollection(ctx context.Context, database, collection string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	
 	db, exists := e.databases[database]
 	if !exists {
 		return fmt.Errorf("数据库 %s 不存在", database)
@@ -146,12 +187,28 @@ func (e *WiredTigerEngine) CreateCollection(ctx context.Context, database, colle
 	if _, exists := db.Collections[collection]; exists {
 		return fmt.Errorf("集合 %s 已存在", collection)
 	}
+	
+	// 创建 RecordStore
+	namespace := makeNamespace(database, collection)
+	recordStore, err := e.kvEngine.CreateRecordStore(namespace)
+	if err != nil {
+		return fmt.Errorf("创建 RecordStore 失败: %w", err)
+	}
+	
+	// 创建默认的 _id 索引
+	idxName := "_id_"
+	idIndex, err := e.kvEngine.CreateSortedDataInterface(namespace, idxName, true)
+	if err != nil {
+		return fmt.Errorf("创建 _id 索引失败: %w", err)
+	}
 
 	db.Collections[collection] = &Collection{
-		Name:      collection,
-		Documents: make([]Document, 0),
-		Indexes:   make(map[string]Index),
+		Name:        collection,
+		RecordStore: recordStore,
+		Indexes:     make(map[string]SortedDataInterface),
 	}
+	db.Collections[collection].Indexes[idxName] = idIndex
+	
 	return nil
 }
 
@@ -186,34 +243,92 @@ func (e *WiredTigerEngine) ListCollections(ctx context.Context, database string)
 
 // Insert 插入文档
 func (e *WiredTigerEngine) Insert(ctx context.Context, database, collection string, documents []Document) error {
+	e.mu.RLock()
 	db, exists := e.databases[database]
 	if !exists {
+		e.mu.RUnlock()
 		return fmt.Errorf("数据库 %s 不存在", database)
 	}
 
 	coll, exists := db.Collections[collection]
 	if !exists {
+		e.mu.RUnlock()
 		return fmt.Errorf("集合 %s 不存在", collection)
 	}
-
-	coll.Documents = append(coll.Documents, documents...)
+	e.mu.RUnlock()
+	
+	// 插入每个文档
+	for _, doc := range documents {
+		// 生成 RecordId
+		recordId := NewRecordIdFromLong(atomic.AddInt64(&e.nextRecordId, 1))
+		
+		// 确保文档有 _id 字段
+		if _, hasId := doc["_id"]; !hasId {
+			doc["_id"] = recordId.String()
+		}
+		
+		// 将文档序列化为 BSON
+		data, err := e.documentToBSON(doc)
+		if err != nil {
+			return fmt.Errorf("序列化文档失败: %w", err)
+		}
+		
+		// 插入到 RecordStore
+		if err := coll.RecordStore.InsertRecord(ctx, recordId, data); err != nil {
+			return fmt.Errorf("插入记录失败: %w", err)
+		}
+		
+		// 更新索引
+		for _, idx := range coll.Indexes {
+			// 提取索引键（简化实现，这里使用 _id）
+			idxKey := []byte(doc["_id"].(string))
+			if err := idx.Insert(ctx, idxKey, recordId); err != nil {
+				return fmt.Errorf("更新索引失败: %w", err)
+			}
+		}
+	}
+	
 	return nil
 }
 
 // Find 查找文档
 func (e *WiredTigerEngine) Find(ctx context.Context, database, collection string, filter Document) ([]Document, error) {
+	e.mu.RLock()
 	db, exists := e.databases[database]
 	if !exists {
+		e.mu.RUnlock()
 		return nil, fmt.Errorf("数据库 %s 不存在", database)
 	}
 
 	coll, exists := db.Collections[collection]
 	if !exists {
+		e.mu.RUnlock()
 		return nil, fmt.Errorf("集合 %s 不存在", collection)
 	}
+	e.mu.RUnlock()
 
-	// TODO: 实现更复杂的查询逻辑
-	return coll.Documents, nil
+	// 扫描所有记录（简化实现）
+	cursor, err := coll.RecordStore.Scan(ctx, NullRecordId())
+	if err != nil {
+		return nil, fmt.Errorf("扫描记录失败: %w", err)
+	}
+	defer cursor.Close()
+	
+	results := make([]Document, 0)
+	for cursor.Next() {
+		data := cursor.Data()
+		
+		// 将 BSON 反序列化为文档
+		doc, err := e.bsonToDocument(data)
+		if err != nil {
+			continue
+		}
+		
+		// TODO: 应用过滤器
+		results = append(results, doc)
+	}
+	
+	return results, nil
 }
 
 // Update 更新文档
@@ -248,10 +363,19 @@ func (e *WiredTigerEngine) ListIndexes(ctx context.Context, database, collection
 
 // GetStats 获取统计信息
 func (e *WiredTigerEngine) GetStats() map[string]interface{} {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	
 	stats := make(map[string]interface{})
 	stats["engine"] = "wiredTiger"
 	stats["running"] = e.running
 	stats["databases"] = len(e.databases)
+	
+	// 添加 KV 引擎统计
+	if e.kvEngine != nil {
+		stats["kv_engine"] = e.kvEngine.GetStats()
+	}
+	
 	return stats
 }
 
@@ -263,9 +387,9 @@ type Database struct {
 
 // Collection 集合结构
 type Collection struct {
-	Name      string
-	Documents []Document
-	Indexes   map[string]Index
+	Name        string
+	RecordStore RecordStore                     // B+Tree 记录存储
+	Indexes     map[string]SortedDataInterface // 索引映射
 }
 
 // MemoryEngine 内存存储引擎
@@ -283,4 +407,25 @@ func NewMemoryEngine(cfg config.StorageConfig) (*MemoryEngine, error) {
 	return &MemoryEngine{
 		WiredTigerEngine: wt,
 	}, nil
+}
+
+// makeNamespace 创建命名空间
+func makeNamespace(database, collection string) string {
+	return database + "." + collection
+}
+
+// documentToBSON 将 Document 转换为 BSON 字节数组
+func (e *WiredTigerEngine) documentToBSON(doc Document) ([]byte, error) {
+	// 简化实现：使用 JSON 编码
+	// TODO: 在生产环境中应该使用真正的 BSON 编码
+	return json.Marshal(doc)
+}
+
+// bsonToDocument 将 BSON 字节数组转换为 Document
+func (e *WiredTigerEngine) bsonToDocument(data []byte) (Document, error) {
+	// 简化实现：使用 JSON 解码
+	// TODO: 在生产环境中应该使用真正的 BSON 解码
+	var doc Document
+	err := json.Unmarshal(data, &doc)
+	return doc, err
 }
