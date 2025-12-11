@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/AlexStocks/getty"
+	getty "github.com/apache/dubbo-getty"
 )
 
 // PackageHandler MongoDB 协议包处理器

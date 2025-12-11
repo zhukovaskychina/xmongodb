@@ -3,7 +3,7 @@ package protocol
 import (
 	"context"
 
-	"github.com/AlexStocks/getty"
+	getty "github.com/apache/dubbo-getty"
 	"github.com/zhukovaskychina/xmongodb/logger"
 	"github.com/zhukovaskychina/xmongodb/server/storage"
 )

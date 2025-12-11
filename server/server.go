@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AlexStocks/getty"
+	getty "github.com/apache/dubbo-getty"
 	"github.com/zhukovaskychina/xmongodb/config"
 	"github.com/zhukovaskychina/xmongodb/logger"
 	"github.com/zhukovaskychina/xmongodb/server/protocol"
